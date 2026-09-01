@@ -1,0 +1,15 @@
+[package]
+name = "pgbox"
+version = "1.0.0"
+edition = "2021"
+authors = ["Hydratik <engineering@pgboxhub.com>"]
+description = "Official Rust client SDK for PGBox Cloud"
+license = "MIT"
+repository = "https://github.com/Hydratik/pgbox-rs"
+
+[dependencies]
+reqwest = { version = "0.11", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+thiserror = "1.0"
