@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
-pub enum PGBoxError {
+pub enum PGBHubError {
     #[error("HTTP request error: {0}")]
     Http(#[from] reqwest::Error),
     #[error("API error [{status}]: {message}")]
@@ -14,17 +14,17 @@ pub enum PGBoxError {
 }
 
 #[derive(Debug, Clone)]
-pub struct PGBoxConfig {
+pub struct PGBHubConfig {
     pub endpoint: String,
     pub api_key: Option<String>,
     pub database: String,
 }
 
-impl Default for PGBoxConfig {
+impl Default for PGBHubConfig {
     fn default() -> Self {
         Self {
-            endpoint: "https://cloud.pgboxhub.com".to_string(),
-            api_key: std::env::var("PGBOX_API_KEY").ok(),
+            endpoint: "https://cloud.pgbhub.com".to_string(),
+            api_key: std::env::var("PGBHUB_API_KEY").ok(),
             database: "postgres".to_string(),
         }
     }
@@ -41,20 +41,20 @@ pub struct ActionResponse {
     pub message: Option<String>,
 }
 
-pub struct PGBoxClient {
-    config: PGBoxConfig,
+pub struct PGBHubClient {
+    config: PGBHubConfig,
     http: HttpClient,
 }
 
-impl PGBoxClient {
-    pub fn new(config: PGBoxConfig) -> Self {
+impl PGBHubClient {
+    pub fn new(config: PGBHubConfig) -> Self {
         Self {
             config,
             http: HttpClient::new(),
         }
     }
 
-    pub async fn get_schema(&self) -> Result<serde_json::Value, PGBoxError> {
+    pub async fn get_schema(&self) -> Result<serde_json::Value, PGBHubError> {
         let url = format!(
             "{}/api/v1/databases/{}/schema.json",
             self.config.endpoint.trim_end_matches('/'),
@@ -70,7 +70,7 @@ impl PGBoxClient {
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let msg = resp.text().await.unwrap_or_default();
-            return Err(PGBoxError::Api { status, message: msg });
+            return Err(PGBHubError::Api { status, message: msg });
         }
 
         Ok(resp.json::<serde_json::Value>().await?)
@@ -81,7 +81,7 @@ impl PGBoxClient {
         action: &str,
         params: HashMap<String, serde_json::Value>,
         dry_run: bool,
-    ) -> Result<ActionResponse, PGBoxError> {
+    ) -> Result<ActionResponse, PGBHubError> {
         let url = format!(
             "{}/v1/actions/invoke",
             self.config.endpoint.trim_end_matches('/')
@@ -103,7 +103,7 @@ impl PGBoxClient {
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let msg = resp.text().await.unwrap_or_default();
-            return Err(PGBoxError::Api { status, message: msg });
+            return Err(PGBHubError::Api { status, message: msg });
         }
 
         Ok(resp.json::<ActionResponse>().await?)

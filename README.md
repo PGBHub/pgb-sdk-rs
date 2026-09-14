@@ -1,6 +1,6 @@
-# pgbox-rs
+# pgbhub-rs
 
-Official Rust client SDK for **PGBox Cloud**.
+Official Rust client SDK for **PGBHub Cloud**.
 
 ## Installation
 
@@ -8,21 +8,21 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-pgbox = { git = "https://github.com/Hydratik/pgbox-rs" }
+pgbhub = { git = "https://github.com/Hydratik/pgbhub-rs" }
 tokio = { version = "1.0", features = ["full"] }
 ```
 
 ## Quick Start
 
 ```rust
-use pgbox::{PGBoxClient, PGBoxConfig};
+use pgbhub::{PGBHubClient, PGBHubConfig};
 use std::collections::HashMap;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = PGBoxClient::new(PGBoxConfig {
+    let client = PGBHubClient::new(PGBHubConfig {
         api_key: Some("your_api_key".to_string()),
-        endpoint: "https://cloud.pgboxhub.com".to_string(),
+        endpoint: "https://cloud.pgbhub.com".to_string(),
         database: "my_database".to_string(),
     });
 
