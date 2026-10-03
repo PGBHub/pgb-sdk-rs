@@ -18,6 +18,9 @@ pub struct PGBHubConfig {
     pub endpoint: String,
     pub api_key: Option<String>,
     pub database: String,
+    /// Required by QueuesClient, whose routes are addressed by project
+    /// rather than database.
+    pub project_id: Option<String>,
 }
 
 impl Default for PGBHubConfig {
@@ -26,6 +29,7 @@ impl Default for PGBHubConfig {
             endpoint: "https://cloud.pgbhub.com".to_string(),
             api_key: std::env::var("PGBHUB_API_KEY").ok(),
             database: "postgres".to_string(),
+            project_id: std::env::var("PGBHUB_PROJECT_ID").ok(),
         }
     }
 }
@@ -52,6 +56,14 @@ pub struct PGBHubClient {
     pub storage: StorageClient,
     /// Covers deploy/delete/invoke/list of serverless cloud functions.
     pub functions: FunctionsClient,
+    /// Covers scheduled job management, addressed by database name.
+    pub cron: CronClient,
+    /// Covers the on-demand asynchronous background job queue.
+    pub jobs: JobsClient,
+    /// Covers durable message queues (send/receive/ack/nack).
+    pub queues: QueuesClient,
+    /// Covers broadcast/subscribe channels.
+    pub realtime: RealtimeClient,
 }
 
 impl PGBHubClient {
@@ -70,12 +82,39 @@ impl PGBHubClient {
             database: config.database.clone(),
             http: http.clone(),
         };
+        let cron = CronClient {
+            endpoint: endpoint.clone(),
+            api_key: config.api_key.clone(),
+            database: config.database.clone(),
+            http: http.clone(),
+        };
+        let jobs = JobsClient {
+            endpoint: endpoint.clone(),
+            api_key: config.api_key.clone(),
+            database: config.database.clone(),
+            http: http.clone(),
+        };
+        let queues = QueuesClient {
+            endpoint: endpoint.clone(),
+            api_key: config.api_key.clone(),
+            project_id: config.project_id.clone(),
+            http: http.clone(),
+        };
+        let realtime = RealtimeClient {
+            endpoint: endpoint.clone(),
+            api_key: config.api_key.clone(),
+            http: http.clone(),
+        };
         Self {
             config,
             http,
             auth,
             storage,
             functions,
+            cron,
+            jobs,
+            queues,
+            realtime,
         }
     }
 
@@ -967,4 +1006,735 @@ pub struct CreateDatabaseResult {
     pub public_port: i64,
     pub url: String,
     pub message: String,
+}
+
+// ─── Cron ──────────────────────────────────────────────────────────────
+
+/// A scheduled cron job's stored configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CronJob {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub expression: String,
+    #[serde(default)]
+    pub timezone: Option<String>,
+    pub target_type: String,
+    #[serde(default)]
+    pub target_config: serde_json::Value,
+    #[serde(default)]
+    pub is_enabled: bool,
+    #[serde(default)]
+    pub concurrency_policy: Option<String>,
+    #[serde(default)]
+    pub timeout_seconds: Option<i64>,
+    #[serde(default)]
+    pub max_retries: Option<i64>,
+    #[serde(default)]
+    pub last_run_at: Option<String>,
+    #[serde(default)]
+    pub last_status: Option<String>,
+    #[serde(default)]
+    pub next_run_at: Option<String>,
+}
+
+/// One execution record for a cron job.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CronRun {
+    pub id: String,
+    pub cron_id: String,
+    pub status: String,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub finished_at: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Optional fields `CronClient::create` accepts beyond name/expression/
+/// target_type/target_config.
+#[derive(Debug, Clone, Default)]
+pub struct CreateCronJobOptions {
+    pub description: Option<String>,
+    pub timezone: Option<String>,
+    pub is_enabled: Option<bool>,
+    pub concurrency_policy: Option<String>,
+    pub timeout_seconds: Option<i64>,
+    pub max_retries: Option<i64>,
+    pub retry_delay_seconds: Option<i64>,
+}
+
+/// Optional fields `CronClient::update` accepts.
+#[derive(Debug, Clone, Default)]
+pub struct UpdateCronJobFields {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub expression: Option<String>,
+    pub timezone: Option<String>,
+    pub concurrency_policy: Option<String>,
+    pub timeout_seconds: Option<i64>,
+    pub max_retries: Option<i64>,
+    pub target_type: Option<String>,
+    pub target_config: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct CronsEnvelope {
+    crons: Vec<CronJob>,
+}
+
+#[derive(Deserialize)]
+struct CronRunsEnvelope {
+    runs: Vec<CronRun>,
+}
+
+/// Scheduled (cron) job management (`client.cron`), addressed by
+/// database name. target_config's shape depends on target_type:
+/// function -> {function_name, payload}, sql -> {sql},
+/// action -> {action_name, params}, http -> {url, method, body?},
+/// mail -> {to, subject, body}.
+pub struct CronClient {
+    endpoint: String,
+    api_key: Option<String>,
+    database: String,
+    http: HttpClient,
+}
+
+impl CronClient {
+    fn base(&self) -> String {
+        format!("{}/api/v1/databases/{}/crons", self.endpoint, self.database)
+    }
+
+    /// Lists scheduled cron jobs.
+    pub async fn list(&self) -> Result<Vec<CronJob>, PGBHubError> {
+        let result: CronsEnvelope = request_json(
+            &self.http,
+            reqwest::Method::GET,
+            &self.base(),
+            &self.api_key,
+            &[],
+            None,
+        )
+        .await?;
+        Ok(result.crons)
+    }
+
+    /// Creates a scheduled cron job.
+    pub async fn create(
+        &self,
+        name: &str,
+        expression: &str,
+        target_type: &str,
+        target_config: serde_json::Value,
+        options: Option<CreateCronJobOptions>,
+    ) -> Result<CronJob, PGBHubError> {
+        let mut body = serde_json::json!({
+            "name": name,
+            "expression": expression,
+            "target_type": target_type,
+            "target_config": target_config,
+        });
+        if let Some(opts) = options {
+            let obj = body.as_object_mut().expect("body is always a JSON object");
+            if let Some(v) = opts.description {
+                obj.insert("description".into(), serde_json::json!(v));
+            }
+            if let Some(v) = opts.timezone {
+                obj.insert("timezone".into(), serde_json::json!(v));
+            }
+            if let Some(v) = opts.is_enabled {
+                obj.insert("is_enabled".into(), serde_json::json!(v));
+            }
+            if let Some(v) = opts.concurrency_policy {
+                obj.insert("concurrency_policy".into(), serde_json::json!(v));
+            }
+            if let Some(v) = opts.timeout_seconds {
+                obj.insert("timeout_seconds".into(), serde_json::json!(v));
+            }
+            if let Some(v) = opts.max_retries {
+                obj.insert("max_retries".into(), serde_json::json!(v));
+            }
+            if let Some(v) = opts.retry_delay_seconds {
+                obj.insert("retry_delay_seconds".into(), serde_json::json!(v));
+            }
+        }
+        request_json(
+            &self.http,
+            reqwest::Method::POST,
+            &self.base(),
+            &self.api_key,
+            &[],
+            Some(body),
+        )
+        .await
+    }
+
+    /// Enables or disables a cron job.
+    pub async fn toggle(&self, cron_id: &str, enabled: bool) -> Result<CronJob, PGBHubError> {
+        let url = format!("{}/{}/toggle", self.base(), cron_id);
+        let body = serde_json::json!({"enabled": enabled});
+        request_json(
+            &self.http,
+            reqwest::Method::POST,
+            &url,
+            &self.api_key,
+            &[],
+            Some(body),
+        )
+        .await
+    }
+
+    /// Manually triggers a cron job to run immediately.
+    pub async fn run(&self, cron_id: &str) -> Result<serde_json::Value, PGBHubError> {
+        let url = format!("{}/{}/run", self.base(), cron_id);
+        request_json(
+            &self.http,
+            reqwest::Method::POST,
+            &url,
+            &self.api_key,
+            &[],
+            None,
+        )
+        .await
+    }
+
+    /// Deletes a cron job.
+    pub async fn delete(&self, cron_id: &str) -> Result<(), PGBHubError> {
+        let url = format!("{}/{}", self.base(), cron_id);
+        let _: serde_json::Value = request_json(
+            &self.http,
+            reqwest::Method::DELETE,
+            &url,
+            &self.api_key,
+            &[],
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Lists recent run history for a cron job.
+    pub async fn list_runs(
+        &self,
+        cron_id: &str,
+        limit: Option<u32>,
+    ) -> Result<Vec<CronRun>, PGBHubError> {
+        let url = format!(
+            "{}/{}/runs?limit={}",
+            self.base(),
+            cron_id,
+            limit.unwrap_or(50)
+        );
+        let result: CronRunsEnvelope = request_json(
+            &self.http,
+            reqwest::Method::GET,
+            &url,
+            &self.api_key,
+            &[],
+            None,
+        )
+        .await?;
+        Ok(result.runs)
+    }
+
+    /// Updates a cron job's configuration.
+    pub async fn update(
+        &self,
+        cron_id: &str,
+        fields: UpdateCronJobFields,
+    ) -> Result<CronJob, PGBHubError> {
+        let mut body = serde_json::Map::new();
+        if let Some(v) = fields.name {
+            body.insert("name".into(), serde_json::json!(v));
+        }
+        if let Some(v) = fields.description {
+            body.insert("description".into(), serde_json::json!(v));
+        }
+        if let Some(v) = fields.expression {
+            body.insert("expression".into(), serde_json::json!(v));
+        }
+        if let Some(v) = fields.timezone {
+            body.insert("timezone".into(), serde_json::json!(v));
+        }
+        if let Some(v) = fields.concurrency_policy {
+            body.insert("concurrency_policy".into(), serde_json::json!(v));
+        }
+        if let Some(v) = fields.timeout_seconds {
+            body.insert("timeout_seconds".into(), serde_json::json!(v));
+        }
+        if let Some(v) = fields.max_retries {
+            body.insert("max_retries".into(), serde_json::json!(v));
+        }
+        if let Some(v) = fields.target_type {
+            body.insert("target_type".into(), serde_json::json!(v));
+        }
+        if let Some(v) = fields.target_config {
+            body.insert("target_config".into(), v);
+        }
+        let url = format!("{}/{}", self.base(), cron_id);
+        request_json(
+            &self.http,
+            reqwest::Method::PATCH,
+            &url,
+            &self.api_key,
+            &[],
+            Some(serde_json::Value::Object(body)),
+        )
+        .await
+    }
+}
+
+// ─── Jobs ──────────────────────────────────────────────────────────────
+
+/// An on-demand asynchronous background job.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BackgroundJob {
+    pub id: i64,
+    pub job_type: String,
+    pub target_type: String,
+    #[serde(default)]
+    pub target_config: serde_json::Value,
+    #[serde(default)]
+    pub payload: serde_json::Value,
+    pub status: String,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    #[serde(default)]
+    pub attempts: i64,
+    #[serde(default)]
+    pub max_attempts: i64,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+/// Optional fields `JobsClient::enqueue` accepts.
+#[derive(Debug, Clone, Default)]
+pub struct EnqueueJobOptions {
+    pub payload: Option<serde_json::Value>,
+    pub idempotency_key: Option<String>,
+    pub max_attempts: Option<i64>,
+}
+
+/// Filters `JobsClient::list`.
+#[derive(Debug, Clone, Default)]
+pub struct ListJobsOptions {
+    pub status: Option<String>,
+    pub limit: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct JobEnvelope {
+    job: BackgroundJob,
+}
+
+#[derive(Deserialize)]
+struct JobsEnvelope {
+    jobs: Vec<BackgroundJob>,
+}
+
+#[derive(Deserialize)]
+struct CancelEnvelope {
+    cancelled: bool,
+}
+
+/// On-demand asynchronous background job queue (`client.jobs`),
+/// addressed by database name. Execution happens out-of-band in the
+/// server's own jobs scheduler -- these methods only enqueue/inspect/
+/// cancel.
+pub struct JobsClient {
+    endpoint: String,
+    api_key: Option<String>,
+    database: String,
+    http: HttpClient,
+}
+
+impl JobsClient {
+    fn base(&self) -> String {
+        format!("{}/api/v1/databases/{}/jobs", self.endpoint, self.database)
+    }
+
+    /// Enqueues a new background job.
+    pub async fn enqueue(
+        &self,
+        job_type: &str,
+        target_type: &str,
+        target_config: serde_json::Value,
+        options: Option<EnqueueJobOptions>,
+    ) -> Result<BackgroundJob, PGBHubError> {
+        let mut body = serde_json::json!({"job_type": job_type, "target_type": target_type, "target_config": target_config});
+        if let Some(opts) = options {
+            let obj = body.as_object_mut().expect("body is always a JSON object");
+            if let Some(v) = opts.payload {
+                obj.insert("payload".into(), v);
+            }
+            if let Some(v) = opts.idempotency_key {
+                obj.insert("idempotency_key".into(), serde_json::json!(v));
+            }
+            if let Some(v) = opts.max_attempts {
+                obj.insert("max_attempts".into(), serde_json::json!(v));
+            }
+        }
+        let result: JobEnvelope = request_json(
+            &self.http,
+            reqwest::Method::POST,
+            &self.base(),
+            &self.api_key,
+            &[],
+            Some(body),
+        )
+        .await?;
+        Ok(result.job)
+    }
+
+    /// Fetches a single job by ID, or `None` if not found.
+    pub async fn get(&self, job_id: i64) -> Result<Option<BackgroundJob>, PGBHubError> {
+        let url = format!("{}/{}", self.base(), job_id);
+        match request_json::<JobEnvelope>(
+            &self.http,
+            reqwest::Method::GET,
+            &url,
+            &self.api_key,
+            &[],
+            None,
+        )
+        .await
+        {
+            Ok(r) => Ok(Some(r.job)),
+            Err(PGBHubError::Api { status: 404, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Lists jobs, optionally filtered by status.
+    pub async fn list(
+        &self,
+        options: Option<ListJobsOptions>,
+    ) -> Result<Vec<BackgroundJob>, PGBHubError> {
+        let opts = options.unwrap_or_default();
+        let mut url = format!("{}?limit={}", self.base(), opts.limit.unwrap_or(100));
+        if let Some(status) = opts.status {
+            url.push_str(&format!("&status={}", status));
+        }
+        let result: JobsEnvelope = request_json(
+            &self.http,
+            reqwest::Method::GET,
+            &url,
+            &self.api_key,
+            &[],
+            None,
+        )
+        .await?;
+        Ok(result.jobs)
+    }
+
+    /// Cancels a pending/running job. Returns `Ok(false)` if it could
+    /// not be cancelled (already running or finished) instead of an error.
+    pub async fn cancel(&self, job_id: i64) -> Result<bool, PGBHubError> {
+        let url = format!("{}/{}/cancel", self.base(), job_id);
+        match request_json::<CancelEnvelope>(
+            &self.http,
+            reqwest::Method::POST,
+            &url,
+            &self.api_key,
+            &[],
+            None,
+        )
+        .await
+        {
+            Ok(r) => Ok(r.cancelled),
+            Err(PGBHubError::Api { status: 409, .. }) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+// ─── Queues ──────────────────────────────────────────────────────────────
+
+/// Returned by `QueuesClient::send`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SentMessage {
+    pub message_id: String,
+    pub queue_name: String,
+    pub status: String,
+    #[serde(default)]
+    pub scheduled_at: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub deduplicated: bool,
+}
+
+/// One message returned by `QueuesClient::receive`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ReceivedMessage {
+    pub message_id: String,
+    #[serde(default)]
+    pub payload: serde_json::Value,
+}
+
+/// Optional fields `QueuesClient::send` accepts.
+#[derive(Debug, Clone, Default)]
+pub struct SendMessageOptions {
+    pub delay_seconds: Option<i64>,
+    pub deduplication_id: Option<String>,
+}
+
+/// Optional fields `QueuesClient::receive` accepts.
+#[derive(Debug, Clone, Default)]
+pub struct ReceiveMessagesOptions {
+    pub max_messages: Option<i64>,
+    pub visibility_timeout: Option<i64>,
+    pub consumer_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SendEnvelope {
+    message: SentMessage,
+}
+
+#[derive(Deserialize)]
+struct ReceiveEnvelope {
+    messages: Vec<ReceivedMessage>,
+}
+
+#[derive(Deserialize)]
+struct OkEnvelope {
+    ok: bool,
+}
+
+/// Durable message queues (`client.queues`). Unlike Cron/Jobs/
+/// Functions, queue routes are addressed by project ID, not database
+/// name (/api/v1/projects/{id}/queues/...) -- set
+/// `PGBHubConfig::project_id` or `PGBHUB_PROJECT_ID`. Queue creation/
+/// deletion is dashboard-only today (no API route); this client covers
+/// send/receive/ack/nack against an already-created queue.
+pub struct QueuesClient {
+    endpoint: String,
+    api_key: Option<String>,
+    project_id: Option<String>,
+    http: HttpClient,
+}
+
+impl QueuesClient {
+    fn url(&self, queue_name: &str, action: &str) -> Result<String, PGBHubError> {
+        let project_id = self.project_id.as_ref().ok_or_else(|| PGBHubError::Api {
+            status: 0,
+            message: "QueuesClient requires project_id -- set PGBHubConfig::project_id or PGBHUB_PROJECT_ID.".to_string(),
+        })?;
+        Ok(format!(
+            "{}/api/v1/projects/{}/queues/{}/{}",
+            self.endpoint, project_id, queue_name, action
+        ))
+    }
+
+    /// Sends a message to a queue.
+    pub async fn send(
+        &self,
+        queue_name: &str,
+        payload: serde_json::Value,
+        options: Option<SendMessageOptions>,
+    ) -> Result<SentMessage, PGBHubError> {
+        let url = self.url(queue_name, "send")?;
+        let mut body = serde_json::json!({"payload": payload});
+        if let Some(opts) = options {
+            let obj = body.as_object_mut().expect("body is always a JSON object");
+            if let Some(v) = opts.delay_seconds {
+                obj.insert("delay_seconds".into(), serde_json::json!(v));
+            }
+            if let Some(v) = opts.deduplication_id {
+                obj.insert("deduplication_id".into(), serde_json::json!(v));
+            }
+        }
+        let result: SendEnvelope = request_json(
+            &self.http,
+            reqwest::Method::POST,
+            &url,
+            &self.api_key,
+            &[],
+            Some(body),
+        )
+        .await?;
+        Ok(result.message)
+    }
+
+    /// Receives (and leases) messages from a queue.
+    pub async fn receive(
+        &self,
+        queue_name: &str,
+        options: Option<ReceiveMessagesOptions>,
+    ) -> Result<Vec<ReceivedMessage>, PGBHubError> {
+        let url = self.url(queue_name, "receive")?;
+        let mut body = serde_json::json!({});
+        if let Some(opts) = options {
+            let obj = body.as_object_mut().expect("body is always a JSON object");
+            if let Some(v) = opts.max_messages {
+                obj.insert("max_messages".into(), serde_json::json!(v));
+            }
+            if let Some(v) = opts.visibility_timeout {
+                obj.insert("visibility_timeout".into(), serde_json::json!(v));
+            }
+            if let Some(v) = opts.consumer_id {
+                obj.insert("consumer_id".into(), serde_json::json!(v));
+            }
+        }
+        let result: ReceiveEnvelope = request_json(
+            &self.http,
+            reqwest::Method::POST,
+            &url,
+            &self.api_key,
+            &[],
+            Some(body),
+        )
+        .await?;
+        Ok(result.messages)
+    }
+
+    /// Acknowledges (deletes) a successfully processed message.
+    pub async fn ack(&self, queue_name: &str, message_id: &str) -> Result<bool, PGBHubError> {
+        let url = self.url(queue_name, "ack")?;
+        let body = serde_json::json!({"message_id": message_id});
+        let result: OkEnvelope = request_json(
+            &self.http,
+            reqwest::Method::POST,
+            &url,
+            &self.api_key,
+            &[],
+            Some(body),
+        )
+        .await?;
+        Ok(result.ok)
+    }
+
+    /// Negatively acknowledges a message -- returns it to the queue (or
+    /// to the DLQ past max retries).
+    pub async fn nack(
+        &self,
+        queue_name: &str,
+        message_id: &str,
+        error: Option<&str>,
+    ) -> Result<bool, PGBHubError> {
+        let url = self.url(queue_name, "nack")?;
+        let body = serde_json::json!({"message_id": message_id, "error": error});
+        let result: OkEnvelope = request_json(
+            &self.http,
+            reqwest::Method::POST,
+            &url,
+            &self.api_key,
+            &[],
+            Some(body),
+        )
+        .await?;
+        Ok(result.ok)
+    }
+}
+
+// ─── Realtime ────────────────────────────────────────────────────────────
+
+/// Returned by `RealtimeClient::broadcast`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BroadcastResult {
+    pub ok: bool,
+    #[serde(default)]
+    pub broadcast: serde_json::Value,
+}
+
+/// One event delivered by `RealtimeClient::subscribe`.
+#[derive(Debug, Clone)]
+pub struct RealtimeMsgEvent {
+    pub event: String,
+    pub data: Vec<u8>,
+}
+
+/// Broadcast/subscribe channels (`client.realtime`). Channel names are
+/// namespaced server-side by project, so two different projects'
+/// channels of the same name never collide.
+pub struct RealtimeClient {
+    endpoint: String,
+    api_key: Option<String>,
+    http: HttpClient,
+}
+
+impl RealtimeClient {
+    /// Broadcasts a message to a realtime channel.
+    pub async fn broadcast(
+        &self,
+        channel: &str,
+        payload: serde_json::Value,
+        event: Option<&str>,
+    ) -> Result<BroadcastResult, PGBHubError> {
+        let url = format!(
+            "{}/api/v1/realtime/channels/{}/broadcast",
+            self.endpoint, channel
+        );
+        let body = serde_json::json!({
+            "channel": channel,
+            "event": event.unwrap_or("message"),
+            "payload": payload,
+        });
+        request_json(
+            &self.http,
+            reqwest::Method::POST,
+            &url,
+            &self.api_key,
+            &[],
+            Some(body),
+        )
+        .await
+    }
+
+    /// Subscribes to a realtime channel via Server-Sent Events, calling
+    /// `on_event` for each event as it arrives. Runs until the
+    /// connection ends or errors; the caller typically drives this
+    /// inside its own `tokio::spawn`'d task to run it alongside other
+    /// work and cancel it by aborting that task.
+    pub async fn subscribe<F: FnMut(RealtimeMsgEvent)>(
+        &self,
+        channel: &str,
+        mut on_event: F,
+    ) -> Result<(), PGBHubError> {
+        let url = format!(
+            "{}/api/v1/realtime/stream?channel={}",
+            self.endpoint, channel
+        );
+        let mut req = self.http.get(&url).header("Accept", "text/event-stream");
+        if let Some(ref key) = self.api_key {
+            req = req.header("Authorization", format!("Bearer {}", key));
+        }
+        let mut resp = req.send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let message = resp.text().await.unwrap_or_default();
+            return Err(PGBHubError::Api { status, message });
+        }
+
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut current_event = "message".to_string();
+        let mut current_data: Vec<String> = Vec::new();
+
+        while let Some(chunk) = resp.chunk().await? {
+            buffer.extend_from_slice(&chunk);
+            while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
+                let line_bytes: Vec<u8> = buffer.drain(..=pos).collect();
+                let line = String::from_utf8_lossy(&line_bytes);
+                let line = line.trim_end_matches(['\r', '\n']);
+                if line.is_empty() {
+                    if !current_data.is_empty() {
+                        on_event(RealtimeMsgEvent {
+                            event: current_event.clone(),
+                            data: current_data.join("\n").into_bytes(),
+                        });
+                        current_event = "message".to_string();
+                        current_data.clear();
+                    }
+                } else if let Some(rest) = line.strip_prefix("event:") {
+                    current_event = rest.trim().to_string();
+                } else if let Some(rest) = line.strip_prefix("data:") {
+                    current_data.push(rest.trim().to_string());
+                }
+            }
+        }
+        Ok(())
+    }
 }
