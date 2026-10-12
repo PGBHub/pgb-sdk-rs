@@ -21,6 +21,8 @@ fn make_client(endpoint: String) -> PGBHubClient {
         api_key: Some("pgb_sec_test".to_string()),
         database: "appdb".to_string(),
         project_id: None,
+        retry_delay_ms: 1,
+        ..PGBHubConfig::default()
     })
 }
 
@@ -30,6 +32,8 @@ fn make_client_with_project(endpoint: String, project_id: &str) -> PGBHubClient 
         api_key: Some("pgb_sec_test".to_string()),
         database: "appdb".to_string(),
         project_id: Some(project_id.to_string()),
+        retry_delay_ms: 1,
+        ..PGBHubConfig::default()
     })
 }
 
@@ -77,7 +81,7 @@ async fn sign_in_failure_surfaces_server_error_message() {
         .unwrap_err();
 
     match err {
-        PGBHubError::Api { status, message } => {
+        PGBHubError::Api { status, message, .. } => {
             assert_eq!(status, 400);
             assert!(message.contains("Invalid email or password"));
         }
@@ -300,7 +304,7 @@ async fn create_database_surfaces_403_for_project_scoped_key() {
         .unwrap_err();
 
     match err {
-        PGBHubError::Api { status, message } => {
+        PGBHubError::Api { status, message, .. } => {
             assert_eq!(status, 403);
             assert!(message.contains("scoped to a single project"));
         }

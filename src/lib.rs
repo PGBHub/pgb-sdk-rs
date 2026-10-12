@@ -1,37 +1,162 @@
-use reqwest::Client as HttpClient;
+use reqwest::Client as ReqwestClient;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::time::Duration;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum PGBHubError {
     #[error("HTTP request error: {0}")]
     Http(#[from] reqwest::Error),
+    /// The server answered with a non-2xx status. `message` is the server's
+    /// own message; `code` is its machine-readable error code when it sent
+    /// one, and `retry_after` is how many seconds a rate-limited (429)
+    /// caller was told to wait.
     #[error("API error [{status}]: {message}")]
-    Api { status: u16, message: String },
+    Api {
+        status: u16,
+        message: String,
+        code: Option<String>,
+        retry_after: Option<f64>,
+    },
     #[error("Serialization error: {0}")]
     Json(#[from] serde_json::Error),
 }
 
+impl PGBHubError {
+    /// An API-style error raised by the SDK itself (status 0 = never sent).
+    fn local(code: &str, message: impl Into<String>) -> Self {
+        PGBHubError::Api {
+            status: 0,
+            message: message.into(),
+            code: Some(code.to_string()),
+            retry_after: None,
+        }
+    }
+
+    /// The HTTP status, if the server answered.
+    pub fn status(&self) -> Option<u16> {
+        match self {
+            PGBHubError::Api { status, .. } if *status != 0 => Some(*status),
+            _ => None,
+        }
+    }
+
+    /// The server's machine-readable error code, if it sent one.
+    pub fn code(&self) -> Option<&str> {
+        match self {
+            PGBHubError::Api { code, .. } => code.as_deref(),
+            _ => None,
+        }
+    }
+}
+
+/// Client settings. Leave `endpoint` empty to use `PGBHUB_ENDPOINT` /
+/// `PGBHUB_PROJECT_URL`, then the project's own address
+/// `https://<project_id>.pgbhub.app` (domain from `PGBHUB_PROJECT_DOMAIN`),
+/// then `https://cloud.pgbhub.com`. Leave `database` empty and the server
+/// uses the database the key belongs to.
 #[derive(Debug, Clone)]
 pub struct PGBHubConfig {
     pub endpoint: String,
     pub api_key: Option<String>,
     pub database: String,
-    /// Required by QueuesClient, whose routes are addressed by project
-    /// rather than database.
+    /// Selects the project's address, and is required by QueuesClient,
+    /// whose routes are addressed by project rather than database.
     pub project_id: Option<String>,
+    /// Per-request timeout in seconds (default 30).
+    pub timeout_secs: u64,
+    /// Retries for reads (GET) on 502/503/504 and connection errors
+    /// (default 2). Writes never retry.
+    pub max_retries: u32,
+    /// First backoff step in milliseconds, doubled each retry (default 300).
+    pub retry_delay_ms: u64,
 }
 
 impl Default for PGBHubConfig {
     fn default() -> Self {
         Self {
-            endpoint: "https://cloud.pgbhub.com".to_string(),
-            api_key: std::env::var("PGBHUB_API_KEY").ok(),
-            database: "postgres".to_string(),
+            endpoint: String::new(),
+            api_key: std::env::var("PGBHUB_API_KEY")
+                .ok()
+                .or_else(|| std::env::var("PGBHUB_PUBLISHABLE_KEY").ok()),
+            database: std::env::var("PGBHUB_DATABASE").unwrap_or_default(),
             project_id: std::env::var("PGBHUB_PROJECT_ID").ok(),
+            timeout_secs: 30,
+            max_retries: 2,
+            retry_delay_ms: 300,
         }
     }
+}
+
+fn resolve_endpoint(config: &PGBHubConfig) -> String {
+    let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    let chosen = if !config.endpoint.is_empty() {
+        config.endpoint.clone()
+    } else if let Some(v) = env("PGBHUB_ENDPOINT").or_else(|| env("PGBHUB_PROJECT_URL")) {
+        v
+    } else if let Some(ref id) = config.project_id {
+        let domain = env("PGBHUB_PROJECT_DOMAIN").unwrap_or_else(|| "pgbhub.app".to_string());
+        format!("https://{}.{}", id, domain)
+    } else {
+        "https://cloud.pgbhub.com".to_string()
+    };
+    chosen.trim_end_matches('/').to_string()
+}
+
+/// reqwest's client plus the retry policy every sub-client shares.
+#[derive(Clone)]
+struct HttpClient {
+    inner: ReqwestClient,
+    max_retries: u32,
+    retry_delay: Duration,
+}
+
+impl HttpClient {
+    fn new(config: &PGBHubConfig) -> Self {
+        let inner = ReqwestClient::builder()
+            .timeout(Duration::from_secs(config.timeout_secs.max(1)))
+            .build()
+            .unwrap_or_else(|_| ReqwestClient::new());
+        Self {
+            inner,
+            max_retries: config.max_retries,
+            retry_delay: Duration::from_millis(config.retry_delay_ms),
+        }
+    }
+
+    fn request(&self, method: reqwest::Method, url: &str) -> reqwest::RequestBuilder {
+        self.inner.request(method, url)
+    }
+
+    fn get(&self, url: &str) -> reqwest::RequestBuilder {
+        self.inner.get(url)
+    }
+}
+
+/// Appends query parameters (percent-encoded). `None` values are skipped.
+fn with_query(path: &str, query: &[(&str, Option<String>)]) -> String {
+    let pairs: Vec<String> = query
+        .iter()
+        .filter_map(|(k, v)| v.as_ref().filter(|v| !v.is_empty()).map(|v| format!("{}={}", k, encode_component(v))))
+        .collect();
+    if pairs.is_empty() {
+        path.to_string()
+    } else {
+        format!("{}?{}", path, pairs.join("&"))
+    }
+}
+
+/// Percent-encodes everything but unreserved characters.
+fn encode_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,15 +167,26 @@ pub struct ActionResponse {
     pub duration_ms: f64,
     pub results: serde_json::Value,
     pub outbox_id: Option<i64>,
+    /// How many of the action's effects were queued to run after the SQL committed.
+    #[serde(default)]
+    pub effects_queued: i64,
+    /// On a dry run: what each effect would have done (nothing is run).
+    #[serde(default)]
+    pub effects_preview: Vec<serde_json::Value>,
     pub message: Option<String>,
 }
 
 pub struct PGBHubClient {
     config: PGBHubConfig,
+    endpoint: String,
+    /// The configured database, or "postgres" for the URL-addressed calls when none was set.
+    database: String,
     http: HttpClient,
 
     /// Built-In PGB Auth-as-a-Service client.
     pub auth: AuthClient,
+    /// Invokes and manages actions and their effects.
+    pub actions: ActionsClient,
     /// Covers file/media download (upload/list/delete are not yet
     /// exposed in the Rust SDK -- tracked as follow-up breadth work).
     pub storage: StorageClient,
@@ -68,9 +204,21 @@ pub struct PGBHubClient {
 
 impl PGBHubClient {
     pub fn new(config: PGBHubConfig) -> Self {
-        let endpoint = config.endpoint.trim_end_matches('/').to_string();
-        let http = HttpClient::new();
+        let endpoint = resolve_endpoint(&config);
+        let database_explicit = !config.database.is_empty();
+        let database = if database_explicit {
+            config.database.clone()
+        } else {
+            "postgres".to_string()
+        };
+        let http = HttpClient::new(&config);
         let auth = AuthClient::new(endpoint.clone(), config.api_key.clone(), http.clone());
+        let actions = ActionsClient {
+            endpoint: endpoint.clone(),
+            api_key: config.api_key.clone(),
+            database: if database_explicit { Some(database.clone()) } else { None },
+            http: http.clone(),
+        };
         let storage = StorageClient {
             endpoint: endpoint.clone(),
             api_key: config.api_key.clone(),
@@ -79,19 +227,19 @@ impl PGBHubClient {
         let functions = FunctionsClient {
             endpoint: endpoint.clone(),
             api_key: config.api_key.clone(),
-            database: config.database.clone(),
+            database: database.clone(),
             http: http.clone(),
         };
         let cron = CronClient {
             endpoint: endpoint.clone(),
             api_key: config.api_key.clone(),
-            database: config.database.clone(),
+            database: database.clone(),
             http: http.clone(),
         };
         let jobs = JobsClient {
             endpoint: endpoint.clone(),
             api_key: config.api_key.clone(),
-            database: config.database.clone(),
+            database: database.clone(),
             http: http.clone(),
         };
         let queues = QueuesClient {
@@ -107,8 +255,11 @@ impl PGBHubClient {
         };
         Self {
             config,
+            endpoint,
+            database,
             http,
             auth,
+            actions,
             storage,
             functions,
             cron,
@@ -118,65 +269,29 @@ impl PGBHubClient {
         }
     }
 
+    /// The address requests are sent to.
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
     pub async fn get_schema(&self) -> Result<serde_json::Value, PGBHubError> {
         let url = format!(
             "{}/api/v1/databases/{}/schema.json",
-            self.config.endpoint.trim_end_matches('/'),
-            self.config.database
+            self.endpoint,
+            encode_component(&self.database)
         );
-
-        let mut req = self.http.get(&url).header("Accept", "application/json");
-        if let Some(ref key) = self.config.api_key {
-            req = req.header("Authorization", format!("Bearer {}", key));
-        }
-
-        let resp = req.send().await?;
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let msg = resp.text().await.unwrap_or_default();
-            return Err(PGBHubError::Api {
-                status,
-                message: msg,
-            });
-        }
-
-        Ok(resp.json::<serde_json::Value>().await?)
+        request_json(&self.http, reqwest::Method::GET, &url, &self.config.api_key, &[], None).await
     }
 
+    /// Runs an action by name. With `dry_run` the SQL is simulated and the
+    /// response lists what each effect would have done.
     pub async fn invoke_action(
         &self,
         action: &str,
         params: HashMap<String, serde_json::Value>,
         dry_run: bool,
     ) -> Result<ActionResponse, PGBHubError> {
-        let url = format!(
-            "{}/v1/actions/invoke",
-            self.config.endpoint.trim_end_matches('/')
-        );
-
-        let body = serde_json::json!({
-            "action": action,
-            "params": params,
-            "dry_run": dry_run,
-            "dbname": self.config.database
-        });
-
-        let mut req = self.http.post(&url).json(&body);
-        if let Some(ref key) = self.config.api_key {
-            req = req.header("Authorization", format!("Bearer {}", key));
-        }
-
-        let resp = req.send().await?;
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let msg = resp.text().await.unwrap_or_default();
-            return Err(PGBHubError::Api {
-                status,
-                message: msg,
-            });
-        }
-
-        Ok(resp.json::<ActionResponse>().await?)
+        self.actions.run(action, params, dry_run).await
     }
 
     /// Provisions a new PGBHub-managed PostgreSQL database.
@@ -193,10 +308,7 @@ impl PGBHubClient {
     ) -> Result<CreateDatabaseResult, PGBHubError> {
         let opts = options.unwrap_or_default();
         let pg_version = opts.pg_version.unwrap_or_else(|| "17".to_string());
-        let url = format!(
-            "{}/api/v1/databases",
-            self.config.endpoint.trim_end_matches('/')
-        );
+        let url = format!("{}/api/v1/databases", self.endpoint);
         let body = serde_json::json!({
             "name": name,
             "pg_version": pg_version,
@@ -214,10 +326,32 @@ impl PGBHubClient {
     }
 }
 
-/// Shared HTTP helper used by AuthClient/AuthAdminClient/FunctionsClient/
-/// create_database -- sends an authenticated JSON request and decodes a
-/// 2xx JSON response into `T`, or returns PGBHubError::Api with the
-/// server's own parsed error message on a non-2xx response.
+fn api_error(status: u16, text: &str, retry_after: Option<f64>) -> PGBHubError {
+    let parsed = serde_json::from_str::<serde_json::Value>(text).ok();
+    let field = |name: &str| {
+        parsed
+            .as_ref()
+            .and_then(|v| v.get(name))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    };
+    let message = field("error")
+        .or_else(|| field("detail"))
+        .or_else(|| field("message"))
+        .unwrap_or_else(|| text.to_string());
+    PGBHubError::Api {
+        status,
+        message,
+        code: field("code"),
+        retry_after,
+    }
+}
+
+/// Shared HTTP helper used by every client -- sends an authenticated JSON
+/// request and decodes a 2xx JSON response into `T`, or returns
+/// PGBHubError::Api with the server's own parsed error message. GETs retry
+/// 502/503/504 and connection errors with backoff; writes never retry.
 async fn request_json<T: serde::de::DeserializeOwned>(
     http: &HttpClient,
     method: reqwest::Method,
@@ -226,39 +360,276 @@ async fn request_json<T: serde::de::DeserializeOwned>(
     extra_headers: &[(&str, &str)],
     body: Option<serde_json::Value>,
 ) -> Result<T, PGBHubError> {
-    let mut req = http
-        .request(method, url)
-        .header("Accept", "application/json");
-    if let Some(ref key) = api_key {
-        req = req.header("Authorization", format!("Bearer {}", key));
+    let attempts = if method == reqwest::Method::GET { 1 + http.max_retries } else { 1 };
+    let mut attempt: u32 = 0;
+    loop {
+        let last = attempt + 1 >= attempts;
+        let mut req = http
+            .request(method.clone(), url)
+            .header("Accept", "application/json");
+        if let Some(ref key) = api_key {
+            req = req.header("Authorization", format!("Bearer {}", key));
+        }
+        for (k, v) in extra_headers {
+            req = req.header(*k, *v);
+        }
+        if let Some(ref b) = body {
+            req = req.json(b);
+        }
+
+        let backoff = http.retry_delay * 2u32.saturating_pow(attempt);
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                if !last {
+                    tokio::time::sleep(backoff).await;
+                    attempt += 1;
+                    continue;
+                }
+                return Err(e.into());
+            }
+        };
+        let status = resp.status();
+        let retry_after = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| *v > 0.0);
+        let text = resp.text().await?;
+
+        if matches!(status.as_u16(), 502..=504) && !last {
+            tokio::time::sleep(backoff).await;
+            attempt += 1;
+            continue;
+        }
+        if !status.is_success() {
+            return Err(api_error(status.as_u16(), &text, retry_after));
+        }
+        return Ok(serde_json::from_str(if text.trim().is_empty() { "null" } else { &text })?);
     }
-    for (k, v) in extra_headers {
-        req = req.header(*k, *v);
-    }
-    if let Some(ref b) = body {
-        req = req.json(b);
+}
+
+// ─── Actions ─────────────────────────────────────────────────────────────
+
+/// A registered action.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ActionDefinition {
+    pub name: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub sql_template: Option<String>,
+    #[serde(default)]
+    pub input_schema: Option<serde_json::Value>,
+    #[serde(default)]
+    pub output_schema: Option<serde_json::Value>,
+    #[serde(default)]
+    pub sample_params: Option<serde_json::Value>,
+    /// What the action does after its SQL commits. Each effect is an object
+    /// with a `type` (function, queue, mail, event, job, realtime, container,
+    /// action, webhook); values may use `{{params.x}}` and `{{results.0.id}}`.
+    #[serde(default)]
+    pub effects: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub webhook_url: Option<String>,
+}
+
+/// An action to create or replace.
+#[derive(Debug, Clone, Default)]
+pub struct RegisterActionOptions {
+    pub name: String,
+    /// The SQL, using `%(param)s` placeholders.
+    pub sql: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub input_schema: Option<serde_json::Value>,
+    pub output_schema: Option<serde_json::Value>,
+    pub sample_params: Option<serde_json::Value>,
+    pub effects: Option<Vec<serde_json::Value>>,
+    pub webhook_url: Option<String>,
+}
+
+/// One effect's outcome: delivered, waiting, or failed.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ActionDelivery {
+    pub id: i64,
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub effect: String,
+    /// "pending", "dispatched" or "failed".
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub attempts: i64,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+}
+
+/// Narrows `ActionsClient::deliveries`; `None` means "any".
+#[derive(Debug, Clone, Default)]
+pub struct DeliveryFilter {
+    pub action: Option<String>,
+    pub status: Option<String>,
+    pub limit: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct ActionsEnvelope {
+    actions: Vec<ActionDefinition>,
+}
+
+#[derive(Deserialize)]
+struct DeliveriesEnvelope {
+    deliveries: Vec<ActionDelivery>,
+}
+
+/// Invokes and manages actions and their effects (`client.actions`).
+pub struct ActionsClient {
+    endpoint: String,
+    api_key: Option<String>,
+    /// Only sent when the caller configured a database.
+    database: Option<String>,
+    http: HttpClient,
+}
+
+impl ActionsClient {
+    fn url(&self, path: &str, mut query: Vec<(&str, Option<String>)>) -> String {
+        query.insert(0, ("dbname", self.database.clone()));
+        format!("{}{}", self.endpoint, with_query(path, &query))
     }
 
-    let resp = req.send().await?;
-    let status = resp.status();
-    let text = resp.text().await?;
-
-    if !status.is_success() {
-        let message = serde_json::from_str::<serde_json::Value>(&text)
-            .ok()
-            .and_then(|v| {
-                v.get("error")
-                    .and_then(|e| e.as_str())
-                    .map(|s| s.to_string())
-            })
-            .unwrap_or(text);
-        return Err(PGBHubError::Api {
-            status: status.as_u16(),
-            message,
+    /// Runs an action. With `dry_run` nothing is changed and the response
+    /// lists what each effect would have done.
+    pub async fn run(
+        &self,
+        action: &str,
+        params: HashMap<String, serde_json::Value>,
+        dry_run: bool,
+    ) -> Result<ActionResponse, PGBHubError> {
+        let mut body = serde_json::json!({
+            "action": action,
+            "params": params,
+            "dry_run": dry_run,
         });
+        if let Some(ref db) = self.database {
+            body["dbname"] = serde_json::json!(db);
+        }
+        let url = format!("{}/v1/actions/invoke", self.endpoint);
+        request_json(&self.http, reqwest::Method::POST, &url, &self.api_key, &[], Some(body)).await
     }
 
-    Ok(serde_json::from_str(&text)?)
+    /// Every registered action.
+    pub async fn list(&self) -> Result<Vec<ActionDefinition>, PGBHubError> {
+        let env: ActionsEnvelope = request_json(
+            &self.http,
+            reqwest::Method::GET,
+            &self.url("/v1/actions", vec![]),
+            &self.api_key,
+            &[],
+            None,
+        )
+        .await?;
+        Ok(env.actions)
+    }
+
+    /// One action by name.
+    pub async fn get(&self, name: &str) -> Result<ActionDefinition, PGBHubError> {
+        request_json(
+            &self.http,
+            reqwest::Method::GET,
+            &self.url(&format!("/v1/actions/{}", encode_component(name)), vec![]),
+            &self.api_key,
+            &[],
+            None,
+        )
+        .await
+    }
+
+    /// Creates or replaces an action and its effects.
+    pub async fn register(&self, options: RegisterActionOptions) -> Result<serde_json::Value, PGBHubError> {
+        if options.name.is_empty() || options.sql.is_empty() {
+            return Err(PGBHubError::local(
+                "invalid_request",
+                "register needs a name and sql (use %(param)s placeholders in the SQL).",
+            ));
+        }
+        let mut body = serde_json::json!({
+            "name": options.name,
+            "sql_template": options.sql,
+            "description": options.description.unwrap_or_default(),
+        });
+        let optional = [
+            ("title", options.title.map(serde_json::Value::from)),
+            ("input_schema", options.input_schema),
+            ("output_schema", options.output_schema),
+            ("sample_params", options.sample_params),
+            ("effects", options.effects.map(serde_json::Value::from)),
+            ("webhook_url", options.webhook_url.map(serde_json::Value::from)),
+        ];
+        for (key, value) in optional {
+            if let Some(v) = value {
+                body[key] = v;
+            }
+        }
+        request_json(
+            &self.http,
+            reqwest::Method::POST,
+            &self.url("/v1/actions/register", vec![]),
+            &self.api_key,
+            &[],
+            Some(body),
+        )
+        .await
+    }
+
+    /// Removes an action.
+    pub async fn delete(&self, name: &str) -> Result<(), PGBHubError> {
+        request_json::<serde_json::Value>(
+            &self.http,
+            reqwest::Method::DELETE,
+            &self.url(&format!("/v1/actions/{}", encode_component(name)), vec![]),
+            &self.api_key,
+            &[],
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// What the actions' effects did: delivered, waiting, or failed (with the reason).
+    pub async fn deliveries(&self, filter: DeliveryFilter) -> Result<Vec<ActionDelivery>, PGBHubError> {
+        let url = self.url(
+            "/v1/actions/deliveries",
+            vec![
+                ("action", filter.action),
+                ("status", filter.status),
+                ("limit", filter.limit.map(|l| l.to_string())),
+            ],
+        );
+        let env: DeliveriesEnvelope =
+            request_json(&self.http, reqwest::Method::GET, &url, &self.api_key, &[], None).await?;
+        Ok(env.deliveries)
+    }
+
+    /// Puts a failed delivery back in the queue.
+    pub async fn retry_delivery(&self, id: i64) -> Result<(), PGBHubError> {
+        request_json::<serde_json::Value>(
+            &self.http,
+            reqwest::Method::POST,
+            &self.url(&format!("/v1/actions/deliveries/{}/retry", id), vec![]),
+            &self.api_key,
+            &[],
+            Some(serde_json::json!({})),
+        )
+        .await
+        .map(|_| ())
+    }
 }
 
 // ─── Auth-as-a-Service ──────────────────────────────────────────────────
@@ -291,16 +662,22 @@ pub struct AuthSession {
     pub expires_at: Option<String>,
 }
 
-/// Returned by sign_up, verify_otp, verify_magic_link, and refresh_session.
+/// Returned by sign_up, verify_otp, verify_magic_link, verify_mfa,
+/// oauth_callback and refresh_session. After sign_up, `session` is None and
+/// `verification_required` is true when the project wants the email
+/// confirmed first.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthResult {
     pub user: Option<AuthUser>,
     pub session: Option<AuthSession>,
+    #[serde(default)]
+    pub verification_required: bool,
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 /// Returned by sign_in. `session` is None and `mfa_required` is true
-/// when the account has MFA enabled -- redeem `challenge_token` via a
-/// future complete_mfa_login call.
+/// when the account has two-factor on: finish with `verify_mfa`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LoginResult {
     #[serde(default)]
@@ -315,26 +692,82 @@ pub struct LoginResult {
     pub expires_in: Option<i64>,
 }
 
-/// Returned by request_otp.
+/// Returned by request_otp. The code itself is only ever emailed; the API
+/// never returns it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OtpRequestResult {
     pub message: String,
-    /// Only populated in sandbox/dev deployments where the server
-    /// returns it directly instead of only emailing it.
-    #[serde(default)]
-    pub otp: Option<String>,
     pub expires_in: i64,
 }
 
-/// Returned by send_magic_link.
+/// Returned by send_magic_link. The link is only ever emailed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MagicLinkRequestResult {
     pub message: String,
-    /// Only populated in sandbox/dev deployments where the server
-    /// returns it directly instead of only emailing it.
-    #[serde(default)]
-    pub token: Option<String>,
     pub expires_in: i64,
+}
+
+/// The plain acknowledgement many auth calls return.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MessageResult {
+    #[serde(default)]
+    pub message: String,
+    /// On change_password: how many other sessions were signed out.
+    #[serde(default)]
+    pub sessions_revoked: i64,
+}
+
+/// One entry in a user's sign-in and security history.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AuthEvent {
+    #[serde(rename = "type", default)]
+    pub event_type: String,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub ip: Option<String>,
+    #[serde(default)]
+    pub user_agent: Option<String>,
+    #[serde(default)]
+    pub detail: serde_json::Value,
+}
+
+/// One signed-in device. `is_current` marks the caller's own.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AuthSessionInfo {
+    pub id: String,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub last_seen_at: Option<String>,
+    #[serde(default)]
+    pub ip: Option<String>,
+    #[serde(default)]
+    pub user_agent: Option<String>,
+    #[serde(default)]
+    pub is_current: bool,
+}
+
+/// Returned by enroll_mfa: show `provisioning_uri` as a QR code (or `secret` as text).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MfaEnrollment {
+    pub secret: String,
+    pub provisioning_uri: String,
+}
+
+/// Returned by confirm_mfa. Show the backup codes once.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MfaConfirmation {
+    pub enabled: bool,
+    #[serde(default)]
+    pub backup_codes: Vec<String>,
+}
+
+/// Returned by oauth_start: send the user to `authorize_url` and check `state` on return.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OAuthStart {
+    pub authorize_url: String,
+    pub state: String,
 }
 
 #[derive(Deserialize)]
@@ -358,8 +791,7 @@ struct SuccessEnvelope {
 /// project Secret/Publishable key) identifies the *project*, sent as
 /// `Authorization: Bearer <key>` on every call; the *end user's* own
 /// access token (held in the session set by sign_up/sign_in/set_session)
-/// is sent separately as `X-PGB-User-Token` on the routes that need to
-/// know who's calling (get_user, sign_out).
+/// is sent separately as `X-PGB-User-Token` on the calls that act as that user.
 pub struct AuthClient {
     endpoint: String,
     api_key: Option<String>,
@@ -385,6 +817,63 @@ impl AuthClient {
         }
     }
 
+    async fn call<T: serde::de::DeserializeOwned>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<serde_json::Value>,
+        user_token: Option<&str>,
+    ) -> Result<T, PGBHubError> {
+        let url = format!("{}{}", self.endpoint, path);
+        let headers: Vec<(&str, &str)> = match user_token {
+            Some(t) => vec![("X-PGB-User-Token", t)],
+            None => vec![],
+        };
+        request_json(&self.http, method, &url, &self.api_key, &headers, body).await
+    }
+
+    async fn post<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<T, PGBHubError> {
+        self.call(reqwest::Method::POST, path, Some(body), None).await
+    }
+
+    /// The signed-in user's access token, or a `not_signed_in` error.
+    fn user_token(&self) -> Result<String, PGBHubError> {
+        self.session
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|s| s.access_token.clone())
+            .ok_or_else(|| {
+                PGBHubError::local(
+                    "not_signed_in",
+                    "PGBHub Auth: no signed-in user (sign in first, or call set_session).",
+                )
+            })
+    }
+
+    fn keep(&self, session: &Option<AuthSession>) {
+        if session.is_some() {
+            *self.session.lock().unwrap() = session.clone();
+        }
+    }
+
+    fn redirect(mut body: serde_json::Value, redirect_to: Option<&str>) -> serde_json::Value {
+        if let Some(r) = redirect_to.filter(|r| !r.is_empty()) {
+            body["redirect_to"] = serde_json::json!(r);
+        }
+        body
+    }
+
+    /// The project's sign-in rules (methods on, password policy, social
+    /// providers) so a UI can adapt. No sign-in needed.
+    pub async fn get_settings(&self) -> Result<serde_json::Value, PGBHubError> {
+        self.call(reqwest::Method::GET, "/auth/settings", None, None).await
+    }
+
     /// Signs up a new user with email & password.
     pub async fn sign_up(
         &self,
@@ -392,22 +881,29 @@ impl AuthClient {
         password: Option<&str>,
         metadata: Option<serde_json::Value>,
     ) -> Result<AuthResult, PGBHubError> {
-        let url = format!("{}/auth/signup", self.endpoint);
-        let body = serde_json::json!({
-            "email": email,
-            "password": password,
-            "metadata": metadata.unwrap_or_else(|| serde_json::json!({})),
-        });
-        let result: AuthResult = request_json(
-            &self.http,
-            reqwest::Method::POST,
-            &url,
-            &self.api_key,
-            &[],
-            Some(body),
-        )
-        .await?;
-        *self.session.lock().unwrap() = result.session.clone();
+        self.sign_up_with_redirect(email, password, metadata, None).await
+    }
+
+    /// Like `sign_up`, with a redirect for the verification email (it must be
+    /// allowed in the project's auth settings). When the project requires
+    /// verification the result has no session.
+    pub async fn sign_up_with_redirect(
+        &self,
+        email: &str,
+        password: Option<&str>,
+        metadata: Option<serde_json::Value>,
+        redirect_to: Option<&str>,
+    ) -> Result<AuthResult, PGBHubError> {
+        let body = Self::redirect(
+            serde_json::json!({
+                "email": email,
+                "password": password,
+                "metadata": metadata.unwrap_or_else(|| serde_json::json!({})),
+            }),
+            redirect_to,
+        );
+        let result: AuthResult = self.post("/auth/signup", body).await?;
+        self.keep(&result.session);
         Ok(result)
     }
 
@@ -417,20 +913,10 @@ impl AuthClient {
         email: &str,
         password: Option<&str>,
     ) -> Result<LoginResult, PGBHubError> {
-        let url = format!("{}/auth/login", self.endpoint);
-        let body = serde_json::json!({"email": email, "password": password});
-        let result: LoginResult = request_json(
-            &self.http,
-            reqwest::Method::POST,
-            &url,
-            &self.api_key,
-            &[],
-            Some(body),
-        )
-        .await?;
-        if result.session.is_some() {
-            *self.session.lock().unwrap() = result.session.clone();
-        }
+        let result: LoginResult = self
+            .post("/auth/login", serde_json::json!({"email": email, "password": password}))
+            .await?;
+        self.keep(&result.session);
         Ok(result)
     }
 
@@ -445,46 +931,36 @@ impl AuthClient {
                 .map(|s| s.access_token.clone())
         };
         if let Some(token) = token {
-            let url = format!("{}/auth/logout", self.endpoint);
-            let _ = request_json::<serde_json::Value>(
-                &self.http,
-                reqwest::Method::POST,
-                &url,
-                &self.api_key,
-                &[("X-PGB-User-Token", token.as_str())],
-                Some(serde_json::json!({})),
-            )
-            .await;
+            // A failed server-side revoke must not block clearing local state.
+            let _ = self
+                .call::<serde_json::Value>(
+                    reqwest::Method::POST,
+                    "/auth/logout",
+                    Some(serde_json::json!({})),
+                    Some(token.as_str()),
+                )
+                .await;
         }
         *self.session.lock().unwrap() = None;
         Ok(())
     }
 
-    /// Returns the current authenticated user's details, or `None`
-    /// without a network call if there is no active session.
+    /// Returns the current user, or `None` without a network call when
+    /// signed out. An expired session (401/403) also returns `None`; other
+    /// failures are errors.
     pub async fn get_user(&self) -> Result<Option<AuthUser>, PGBHubError> {
-        let token = {
-            self.session
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|s| s.access_token.clone())
+        let token = match self.user_token() {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
         };
-        let token = match token {
-            Some(t) => t,
-            None => return Ok(None),
-        };
-        let url = format!("{}/auth/user", self.endpoint);
-        let result: UserEnvelope = request_json(
-            &self.http,
-            reqwest::Method::GET,
-            &url,
-            &self.api_key,
-            &[("X-PGB-User-Token", token.as_str())],
-            None,
-        )
-        .await?;
-        Ok(result.user)
+        match self
+            .call::<UserEnvelope>(reqwest::Method::GET, "/auth/user", None, Some(token.as_str()))
+            .await
+        {
+            Ok(r) => Ok(r.user),
+            Err(PGBHubError::Api { status: 401 | 403, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Returns the current active session, if any.
@@ -513,89 +989,285 @@ impl AuthClient {
                     .unwrap()
                     .as_ref()
                     .map(|s| s.refresh_token.clone());
-                current.ok_or_else(|| PGBHubError::Api {
-                    status: 0,
-                    message: "refresh_session requires a refresh token (none provided and no active session)".to_string(),
+                current.ok_or_else(|| {
+                    PGBHubError::local(
+                        "no_refresh_token",
+                        "refresh_session requires a refresh token (none provided and no active session)",
+                    )
                 })?
             }
         };
-        let url = format!("{}/auth/refresh", self.endpoint);
-        let body = serde_json::json!({"refresh_token": token});
-        let result: AuthResult = request_json(
-            &self.http,
-            reqwest::Method::POST,
-            &url,
-            &self.api_key,
-            &[],
-            Some(body),
-        )
-        .await?;
-        *self.session.lock().unwrap() = result.session.clone();
+        let result: AuthResult = self
+            .post("/auth/refresh", serde_json::json!({"refresh_token": token}))
+            .await?;
+        self.keep(&result.session);
         Ok(result)
     }
 
-    /// Requests a one-time passcode for passwordless sign-in.
+    /// Emails a one-time passcode for passwordless sign-in.
     pub async fn request_otp(&self, email: &str) -> Result<OtpRequestResult, PGBHubError> {
-        let url = format!("{}/auth/otp", self.endpoint);
-        request_json(
-            &self.http,
-            reqwest::Method::POST,
-            &url,
-            &self.api_key,
-            &[],
-            Some(serde_json::json!({"email": email})),
-        )
-        .await
+        self.post("/auth/otp", serde_json::json!({"email": email})).await
     }
 
     /// Verifies a one-time passcode and establishes a session.
     pub async fn verify_otp(&self, email: &str, token: &str) -> Result<AuthResult, PGBHubError> {
-        let url = format!("{}/auth/otp/verify", self.endpoint);
-        let body = serde_json::json!({"email": email, "token": token});
-        let result: AuthResult = request_json(
-            &self.http,
-            reqwest::Method::POST,
-            &url,
-            &self.api_key,
-            &[],
-            Some(body),
-        )
-        .await?;
-        *self.session.lock().unwrap() = result.session.clone();
+        let result: AuthResult = self
+            .post("/auth/otp/verify", serde_json::json!({"email": email, "token": token}))
+            .await?;
+        self.keep(&result.session);
         Ok(result)
     }
 
-    /// Sends a passwordless magic link.
+    /// Emails a passwordless magic link.
     pub async fn send_magic_link(
         &self,
         email: &str,
     ) -> Result<MagicLinkRequestResult, PGBHubError> {
-        let url = format!("{}/auth/magic", self.endpoint);
-        request_json(
-            &self.http,
-            reqwest::Method::POST,
-            &url,
-            &self.api_key,
-            &[],
-            Some(serde_json::json!({"email": email})),
+        self.send_magic_link_to(email, None).await
+    }
+
+    /// Like `send_magic_link`, with a redirect allowed in the project's settings.
+    pub async fn send_magic_link_to(
+        &self,
+        email: &str,
+        redirect_to: Option<&str>,
+    ) -> Result<MagicLinkRequestResult, PGBHubError> {
+        self.post(
+            "/auth/magic",
+            Self::redirect(serde_json::json!({"email": email}), redirect_to),
         )
         .await
     }
 
     /// Verifies a magic link token and establishes a session.
     pub async fn verify_magic_link(&self, token: &str) -> Result<AuthResult, PGBHubError> {
-        let url = format!("{}/auth/magic/verify", self.endpoint);
-        let body = serde_json::json!({"token": token});
-        let result: AuthResult = request_json(
-            &self.http,
-            reqwest::Method::POST,
-            &url,
-            &self.api_key,
-            &[],
-            Some(body),
+        let result: AuthResult = self
+            .post("/auth/magic/verify", serde_json::json!({"token": token}))
+            .await?;
+        self.keep(&result.session);
+        Ok(result)
+    }
+
+    /// Sends the email-verification message again.
+    pub async fn resend_verification(
+        &self,
+        email: &str,
+        redirect_to: Option<&str>,
+    ) -> Result<MessageResult, PGBHubError> {
+        self.post(
+            "/auth/resend-verification",
+            Self::redirect(serde_json::json!({"email": email}), redirect_to),
         )
-        .await?;
-        *self.session.lock().unwrap() = result.session.clone();
+        .await
+    }
+
+    /// Emails a password-reset link. It always succeeds, so it never
+    /// reveals which emails have accounts.
+    pub async fn forgot_password(
+        &self,
+        email: &str,
+        redirect_to: Option<&str>,
+    ) -> Result<MessageResult, PGBHubError> {
+        self.post(
+            "/auth/forgot-password",
+            Self::redirect(serde_json::json!({"email": email}), redirect_to),
+        )
+        .await
+    }
+
+    /// Sets a new password using the token from the reset email.
+    pub async fn reset_password(&self, token: &str, password: &str) -> Result<MessageResult, PGBHubError> {
+        self.post(
+            "/auth/reset-password",
+            serde_json::json!({"token": token, "password": password}),
+        )
+        .await
+    }
+
+    /// Changes the signed-in user's password. Other sessions are signed
+    /// out; this one stays.
+    pub async fn change_password(
+        &self,
+        current_password: Option<&str>,
+        new_password: &str,
+    ) -> Result<MessageResult, PGBHubError> {
+        let token = self.user_token()?;
+        self.call(
+            reqwest::Method::POST,
+            "/auth/user/password",
+            Some(serde_json::json!({
+                "current_password": current_password.unwrap_or(""),
+                "new_password": new_password,
+            })),
+            Some(token.as_str()),
+        )
+        .await
+    }
+
+    /// Merges values into the user's profile (`user_metadata`). A key set
+    /// to null is removed.
+    pub async fn update_user(&self, metadata: serde_json::Value) -> Result<Option<AuthUser>, PGBHubError> {
+        let token = self.user_token()?;
+        let env: UserEnvelope = self
+            .call(
+                reqwest::Method::POST,
+                "/auth/user/update",
+                Some(serde_json::json!({"user_metadata": metadata})),
+                Some(token.as_str()),
+            )
+            .await?;
+        Ok(env.user)
+    }
+
+    /// Permanently deletes the signed-in user's own account and clears the
+    /// local session.
+    pub async fn delete_account(&self, password: Option<&str>) -> Result<MessageResult, PGBHubError> {
+        let token = self.user_token()?;
+        let result: MessageResult = self
+            .call(
+                reqwest::Method::POST,
+                "/auth/user/delete",
+                Some(serde_json::json!({"password": password.unwrap_or("")})),
+                Some(token.as_str()),
+            )
+            .await?;
+        *self.session.lock().unwrap() = None;
+        Ok(result)
+    }
+
+    /// The user's recent sign-ins and security events.
+    pub async fn get_events(&self) -> Result<Vec<AuthEvent>, PGBHubError> {
+        #[derive(Deserialize)]
+        struct Env {
+            #[serde(default)]
+            events: Vec<AuthEvent>,
+        }
+        let token = self.user_token()?;
+        let env: Env = self
+            .call(reqwest::Method::GET, "/auth/user/events", None, Some(token.as_str()))
+            .await?;
+        Ok(env.events)
+    }
+
+    /// The user's active sessions (devices).
+    pub async fn list_sessions(&self) -> Result<Vec<AuthSessionInfo>, PGBHubError> {
+        #[derive(Deserialize)]
+        struct Env {
+            #[serde(default)]
+            sessions: Vec<AuthSessionInfo>,
+        }
+        let token = self.user_token()?;
+        let env: Env = self
+            .call(reqwest::Method::GET, "/auth/sessions", None, Some(token.as_str()))
+            .await?;
+        Ok(env.sessions)
+    }
+
+    /// Signs out one session (for example an old phone).
+    pub async fn revoke_session(&self, session_id: &str) -> Result<(), PGBHubError> {
+        let token = self.user_token()?;
+        self.call::<serde_json::Value>(
+            reqwest::Method::DELETE,
+            &format!("/auth/sessions/{}", encode_component(session_id)),
+            None,
+            Some(token.as_str()),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Signs out every session except this one; returns how many were ended.
+    pub async fn revoke_other_sessions(&self) -> Result<i64, PGBHubError> {
+        #[derive(Deserialize)]
+        struct Env {
+            #[serde(default)]
+            revoked: i64,
+        }
+        let token = self.user_token()?;
+        let env: Env = self
+            .call(
+                reqwest::Method::POST,
+                "/auth/sessions/revoke-all",
+                Some(serde_json::json!({})),
+                Some(token.as_str()),
+            )
+            .await?;
+        Ok(env.revoked)
+    }
+
+    /// Starts two-factor enrolment; finish with `confirm_mfa`.
+    pub async fn enroll_mfa(&self) -> Result<MfaEnrollment, PGBHubError> {
+        let token = self.user_token()?;
+        self.call(
+            reqwest::Method::POST,
+            "/auth/mfa/enroll",
+            Some(serde_json::json!({})),
+            Some(token.as_str()),
+        )
+        .await
+    }
+
+    /// Confirms enrolment with a current code and returns one-time backup codes.
+    pub async fn confirm_mfa(&self, code: &str) -> Result<MfaConfirmation, PGBHubError> {
+        let token = self.user_token()?;
+        self.call(
+            reqwest::Method::POST,
+            "/auth/mfa/confirm",
+            Some(serde_json::json!({"code": code})),
+            Some(token.as_str()),
+        )
+        .await
+    }
+
+    /// Turns two-factor off (needs a current code).
+    pub async fn disable_mfa(&self, code: &str) -> Result<(), PGBHubError> {
+        let token = self.user_token()?;
+        self.call::<serde_json::Value>(
+            reqwest::Method::POST,
+            "/auth/mfa/disable",
+            Some(serde_json::json!({"code": code})),
+            Some(token.as_str()),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Finishes a sign-in that returned `mfa_required`.
+    pub async fn verify_mfa(&self, challenge_token: &str, code: &str) -> Result<AuthResult, PGBHubError> {
+        let result: AuthResult = self
+            .post(
+                "/auth/mfa/verify",
+                serde_json::json!({"challenge_token": challenge_token, "code": code}),
+            )
+            .await?;
+        self.keep(&result.session);
+        Ok(result)
+    }
+
+    /// Returns the provider's authorize URL and the `state` to check on return.
+    pub async fn oauth_start(&self, provider: &str, redirect_uri: &str) -> Result<OAuthStart, PGBHubError> {
+        let path = with_query(
+            &format!("/auth/oauth/{}/start", encode_component(provider)),
+            &[("redirect_uri", Some(redirect_uri.to_string()))],
+        );
+        self.call(reqwest::Method::GET, &path, None, None).await
+    }
+
+    /// Finishes a social sign-in with the `code` and `state` the provider sent back.
+    pub async fn oauth_callback(
+        &self,
+        provider: &str,
+        code: &str,
+        state: &str,
+        redirect_uri: &str,
+    ) -> Result<AuthResult, PGBHubError> {
+        let result: AuthResult = self
+            .post(
+                &format!("/auth/oauth/{}/callback", encode_component(provider)),
+                serde_json::json!({"code": code, "state": state, "redirect_uri": redirect_uri}),
+            )
+            .await?;
+        self.keep(&result.session);
         Ok(result)
     }
 }
@@ -770,10 +1442,7 @@ impl StorageClient {
 
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            return Err(PGBHubError::Api {
-                status: status.as_u16(),
-                message: text,
-            });
+            return Err(api_error(status.as_u16(), &text, None));
         }
 
         let data = resp.bytes().await?.to_vec();
@@ -1519,9 +2188,11 @@ pub struct QueuesClient {
 
 impl QueuesClient {
     fn url(&self, queue_name: &str, action: &str) -> Result<String, PGBHubError> {
-        let project_id = self.project_id.as_ref().ok_or_else(|| PGBHubError::Api {
-            status: 0,
-            message: "QueuesClient requires project_id -- set PGBHubConfig::project_id or PGBHUB_PROJECT_ID.".to_string(),
+        let project_id = self.project_id.as_ref().ok_or_else(|| {
+            PGBHubError::local(
+                "missing_project_id",
+                "QueuesClient requires project_id -- set PGBHubConfig::project_id or PGBHUB_PROJECT_ID.",
+            )
         })?;
         Ok(format!(
             "{}/api/v1/projects/{}/queues/{}/{}",
@@ -1706,7 +2377,7 @@ impl RealtimeClient {
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let message = resp.text().await.unwrap_or_default();
-            return Err(PGBHubError::Api { status, message });
+            return Err(api_error(status, &message, None));
         }
 
         let mut buffer: Vec<u8> = Vec::new();
