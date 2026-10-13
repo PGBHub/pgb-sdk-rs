@@ -44,7 +44,7 @@ fn project_id_selects_the_project_address() {
     // Environment overrides would change the result; the suite does not set them.
     if std::env::var("PGBHUB_ENDPOINT").is_err() && std::env::var("PGBHUB_PROJECT_URL").is_err() && std::env::var("PGBHUB_PROJECT_DOMAIN").is_err() {
         assert_eq!(make(Some("shop")).endpoint(), "https://shop.pgbhub.app");
-        assert_eq!(make(None).endpoint(), "https://cloud.pgbhub.com");
+        assert_eq!(make(None).endpoint(), "https://console.pgbhub.com");
     }
 }
 

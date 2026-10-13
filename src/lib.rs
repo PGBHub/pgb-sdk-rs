@@ -54,7 +54,7 @@ impl PGBHubError {
 /// Client settings. Leave `endpoint` empty to use `PGBHUB_ENDPOINT` /
 /// `PGBHUB_PROJECT_URL`, then the project's own address
 /// `https://<project_id>.pgbhub.app` (domain from `PGBHUB_PROJECT_DOMAIN`),
-/// then `https://cloud.pgbhub.com`. Leave `database` empty and the server
+/// then `https://console.pgbhub.com`. Leave `database` empty and the server
 /// uses the database the key belongs to.
 #[derive(Debug, Clone)]
 pub struct PGBHubConfig {
@@ -99,7 +99,7 @@ fn resolve_endpoint(config: &PGBHubConfig) -> String {
         let domain = env("PGBHUB_PROJECT_DOMAIN").unwrap_or_else(|| "pgbhub.app".to_string());
         format!("https://{}.{}", id, domain)
     } else {
-        "https://cloud.pgbhub.com".to_string()
+        "https://console.pgbhub.com".to_string()
     };
     chosen.trim_end_matches('/').to_string()
 }

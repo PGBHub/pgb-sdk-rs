@@ -38,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Configuration
 
-`PGBHubConfig::default()` reads the environment: `PGBHUB_API_KEY` (or `PGBHUB_PUBLISHABLE_KEY`), `PGBHUB_PROJECT_ID`, `PGBHUB_DATABASE`. An empty `endpoint` resolves from `PGBHUB_ENDPOINT` / `PGBHUB_PROJECT_URL`, then the project address (domain from `PGBHUB_PROJECT_DOMAIN`, default `pgbhub.app`), then `https://cloud.pgbhub.com`.
+`PGBHubConfig::default()` reads the environment: `PGBHUB_API_KEY` (or `PGBHUB_PUBLISHABLE_KEY`), `PGBHUB_PROJECT_ID`, `PGBHUB_DATABASE`. An empty `endpoint` resolves from `PGBHUB_ENDPOINT` / `PGBHUB_PROJECT_URL`, then the project address (domain from `PGBHUB_PROJECT_DOMAIN`, default `pgbhub.app`), then `https://console.pgbhub.com`.
 `timeout_secs` (30), `max_retries` (2) and `retry_delay_ms` (300) tune requests. Reads retry on 502/503/504 and connection errors; writes never retry.
 
 ## Errors
