@@ -96,6 +96,28 @@ client.actions.retry_delivery(12).await?;
 
 Effects run after the SQL commits, retry on their own, and can target a function, queue, mail, event, job, realtime channel, container, another action, or a webhook.
 
+## Mail
+
+```rust
+use pgbhub::SendMailOptions;
+
+match client.mail.send(SendMailOptions {
+    to: "alex@example.com".into(),
+    subject: "Your receipt".into(),
+    text: "Thanks for your order.".into(),
+    html: Some("<p>Thanks for your order.</p>".into()),
+    reply_to: Some("support@acme.dev".into()), // optional: one address for the Reply-To header
+    ..Default::default()
+}).await {
+    Ok(sent) => println!("{:?}", sent.message_id),
+    // 503, code "MAIL_PROVIDER_UNAVAILABLE": no mail provider configured right now
+    Err(e) if e.is_mail_provider_unavailable() => { /* retry later */ }
+    Err(e) => return Err(e.into()),
+}
+```
+
+Sending needs the project's **secret key**. `reply_to` is a single address: line breaks, commas and semicolons are refused with a 400. `message_id` identifies the sent message (on an older server it is filled from `mail_id`). Sends are never retried.
+
 ## License
 
 MIT © [Hydratik](https://github.com/Hydratik)

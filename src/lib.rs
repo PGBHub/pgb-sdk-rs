@@ -49,7 +49,16 @@ impl PGBHubError {
             _ => None,
         }
     }
+
+    /// True for the 503 a mail send gets when the platform has no mail
+    /// provider configured (code `MAIL_PROVIDER_UNAVAILABLE`).
+    pub fn is_mail_provider_unavailable(&self) -> bool {
+        self.code() == Some(MAIL_PROVIDER_UNAVAILABLE)
+    }
 }
+
+/// `PGBHubError::code()` when the platform has no mail provider configured (HTTP 503).
+pub const MAIL_PROVIDER_UNAVAILABLE: &str = "MAIL_PROVIDER_UNAVAILABLE";
 
 /// Client settings. Leave `endpoint` empty to use `PGBHUB_ENDPOINT` /
 /// `PGBHUB_PROJECT_URL`, then the project's own address
@@ -200,6 +209,8 @@ pub struct PGBHubClient {
     pub queues: QueuesClient,
     /// Covers broadcast/subscribe channels.
     pub realtime: RealtimeClient,
+    /// Sends transactional email (needs the project's secret key).
+    pub mail: MailClient,
 }
 
 impl PGBHubClient {
@@ -253,6 +264,11 @@ impl PGBHubClient {
             api_key: config.api_key.clone(),
             http: http.clone(),
         };
+        let mail = MailClient {
+            endpoint: endpoint.clone(),
+            api_key: config.api_key.clone(),
+            http: http.clone(),
+        };
         Self {
             config,
             endpoint,
@@ -266,6 +282,7 @@ impl PGBHubClient {
             jobs,
             queues,
             realtime,
+            mail,
         }
     }
 
@@ -2407,5 +2424,88 @@ impl RealtimeClient {
             }
         }
         Ok(())
+    }
+}
+
+// ─── Mail ────────────────────────────────────────────────────────────────
+
+/// One email for `MailClient::send`. `to`, `subject` and `text` are required.
+#[derive(Debug, Clone, Default)]
+pub struct SendMailOptions {
+    pub to: String,
+    pub subject: String,
+    pub text: String,
+    pub html: Option<String>,
+    /// Sender; `None` uses the project's default.
+    pub from: Option<String>,
+    /// One address for the Reply-To header. The server refuses line breaks,
+    /// commas and semicolons (400). `None` sends no `reply_to`.
+    pub reply_to: Option<String>,
+}
+
+/// The server's answer to a mail send.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MailSendResult {
+    #[serde(default)]
+    pub success: bool,
+    /// Identifies the sent message. Filled from `mail_id` when an older
+    /// server returns only that.
+    #[serde(default)]
+    pub message_id: Option<String>,
+    /// Older name for `message_id`; same value.
+    #[serde(default)]
+    pub mail_id: Option<String>,
+    #[serde(default)]
+    pub to: Option<String>,
+    #[serde(default)]
+    pub from: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+/// Transactional mail (`client.mail`).
+pub struct MailClient {
+    endpoint: String,
+    api_key: Option<String>,
+    http: HttpClient,
+}
+
+impl MailClient {
+    /// Sends one email. A failure is `PGBHubError::Api` with the status and
+    /// the server's code; with no mail provider configured that is 503 and
+    /// `MAIL_PROVIDER_UNAVAILABLE` (see `is_mail_provider_unavailable`).
+    /// Sends are never retried.
+    pub async fn send(&self, options: SendMailOptions) -> Result<MailSendResult, PGBHubError> {
+        let mut body = serde_json::json!({
+            "to": options.to,
+            "subject": options.subject,
+            "text": options.text,
+        });
+        let obj = body.as_object_mut().expect("body is always a JSON object");
+        if let Some(v) = options.html {
+            obj.insert("html".into(), serde_json::json!(v));
+        }
+        if let Some(v) = options.from {
+            obj.insert("from".into(), serde_json::json!(v));
+        }
+        if let Some(v) = options.reply_to.filter(|v| !v.is_empty()) {
+            obj.insert("reply_to".into(), serde_json::json!(v));
+        }
+        let url = format!("{}/mail/send", self.endpoint);
+        let mut result: MailSendResult = request_json(
+            &self.http,
+            reqwest::Method::POST,
+            &url,
+            &self.api_key,
+            &[],
+            Some(body),
+        )
+        .await?;
+        if result.message_id.is_none() {
+            result.message_id = result.mail_id.clone();
+        }
+        Ok(result)
     }
 }

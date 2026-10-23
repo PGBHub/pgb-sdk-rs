@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.0
+
+- Mail: `client.mail.send(SendMailOptions { .. })` posts to `/mail/send`. `reply_to: Option<String>` is sent as `reply_to`, only when set. `MailSendResult.message_id` is filled from `mail_id` when an older server returns only that.
+- Mail: a failed send is `PGBHubError::Api` with `status()` and `code()`; with no mail provider configured that is 503 and `MAIL_PROVIDER_UNAVAILABLE` (exported as a constant). `err.is_mail_provider_unavailable()` checks for it. Sends are never retried.
+
 ## 1.1.0
 
 **Breaking (small)**
