@@ -196,8 +196,7 @@ pub struct PGBHubClient {
     pub auth: AuthClient,
     /// Invokes and manages actions and their effects.
     pub actions: ActionsClient,
-    /// Covers file/media download (upload/list/delete are not yet
-    /// exposed in the Rust SDK -- tracked as follow-up breadth work).
+    /// Covers file/media download, signed URLs and private buckets.
     pub storage: StorageClient,
     /// Covers deploy/delete/invoke/list of serverless cloud functions.
     pub functions: FunctionsClient,
@@ -233,6 +232,7 @@ impl PGBHubClient {
         let storage = StorageClient {
             endpoint: endpoint.clone(),
             api_key: config.api_key.clone(),
+            project_id: config.project_id.clone().filter(|p| !p.is_empty()),
             http: http.clone(),
         };
         let functions = FunctionsClient {
@@ -1425,12 +1425,111 @@ pub struct MediaTransformOptions {
     pub fit: Option<String>,
 }
 
-/// Covers file/media download (`client.storage`). Upload/list/delete
-/// are not yet exposed in the Rust SDK -- tracked as follow-up breadth
-/// work, matching the TS SDK's existing coverage.
+/// Who can read a bucket's objects. Buckets are public unless made private.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BucketVisibility {
+    /// Anyone with an object's URL can read it (the default).
+    #[default]
+    Public,
+    /// Only the project's secret key, console members or a signed URL.
+    Private,
+}
+
+/// The method a signed URL allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum SignedUrlMethod {
+    /// Download (the default). A GET URL also answers HEAD.
+    #[default]
+    Get,
+    /// Upload.
+    Put,
+}
+
+/// Options for `StorageClient::create_signed_url`.
+#[derive(Debug, Clone, Default)]
+pub struct SignedUrlOptions {
+    pub method: SignedUrlMethod,
+    /// Lifetime in seconds. `None` uses the server default (900); at most
+    /// 86400 for GET and 3600 for PUT.
+    pub expires_in_secs: Option<u64>,
+    /// PUT only: the upload must use exactly this Content-Type. Needed to
+    /// allow HTML, SVG, XML or JavaScript uploads.
+    pub content_type: Option<String>,
+}
+
+/// A signed URL for one object and one method. Anyone holding `url` can use
+/// it until it expires.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedUrl {
+    pub url: String,
+    pub path: String,
+    pub method: SignedUrlMethod,
+    #[serde(default)]
+    pub bucket: String,
+    #[serde(default)]
+    pub file_path: String,
+    pub expires_in: u64,
+    /// Unix time (seconds) when the URL stops working.
+    pub expires_at: i64,
+    /// The Content-Type a PUT is bound to.
+    #[serde(default)]
+    pub content_type: Option<String>,
+    pub bucket_visibility: BucketVisibility,
+}
+
+/// What a signed PUT returns.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SignedUploadResult {
+    #[serde(default)]
+    pub success: bool,
+    #[serde(default)]
+    pub bucket: String,
+    #[serde(default)]
+    pub file_path: String,
+    #[serde(default)]
+    pub size_bytes: u64,
+}
+
+/// A created bucket.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Bucket {
+    #[serde(default)]
+    pub success: bool,
+    #[serde(rename = "bucket")]
+    pub name: String,
+    pub visibility: BucketVisibility,
+}
+
+/// The result of `StorageClient::set_bucket_visibility`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BucketVisibilityChange {
+    #[serde(default)]
+    pub success: bool,
+    pub bucket: String,
+    pub visibility: BucketVisibility,
+    pub previous_visibility: BucketVisibility,
+    /// Set when a public bucket went private: copies already cached by
+    /// browsers or the CDN are not recalled.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// `PGBHubError::code()` when `set_bucket_visibility` is asked to make a
+/// bucket public without `confirm_public`. Nothing is sent.
+pub const CONFIRM_PUBLIC_REQUIRED: &str = "confirm_public_required";
+
+/// `client.storage`: file/media download, signed URLs and private buckets.
+///
+/// Buckets are public unless made private. A private bucket's objects are
+/// readable only with the project's secret key (`pgb_sec_...`), by project
+/// members in the console, or through a signed URL; publishable keys never
+/// read them, and their public URLs answer 404.
 pub struct StorageClient {
     endpoint: String,
     api_key: Option<String>,
+    project_id: Option<String>,
     http: HttpClient,
 }
 
@@ -1486,6 +1585,154 @@ impl StorageClient {
         _options: Option<MediaTransformOptions>,
     ) -> Result<StorageFile, PGBHubError> {
         self.get_file(file_path).await
+    }
+
+    /// The project bucket calls address: `project_id` when configured,
+    /// otherwise the slug in a `https://<slug>.pgbhub.app` endpoint.
+    fn project_ref(&self) -> Result<String, PGBHubError> {
+        if let Some(ref id) = self.project_id {
+            return Ok(id.clone());
+        }
+        let domain = std::env::var("PGBHUB_PROJECT_DOMAIN")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "pgbhub.app".to_string());
+        let host = reqwest::Url::parse(&self.endpoint)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
+            .unwrap_or_default();
+        if let Some(slug) = host.strip_suffix(&format!(".{}", domain)) {
+            if !slug.is_empty() && !slug.contains('.') {
+                return Ok(slug.to_string());
+            }
+        }
+        Err(PGBHubError::local(
+            "missing_project_id",
+            "Bucket management needs the project -- set PGBHubConfig::project_id or PGBHUB_PROJECT_ID, \
+             or use the project's address (https://<slug>.pgbhub.app) as the endpoint.",
+        ))
+    }
+
+    fn buckets_url(&self, bucket: Option<&str>, action: &str) -> Result<String, PGBHubError> {
+        let mut url = format!(
+            "{}/api/v1/projects/{}/storage/buckets",
+            self.endpoint,
+            encode_component(&self.project_ref()?)
+        );
+        if let Some(b) = bucket {
+            url.push('/');
+            url.push_str(&encode_component(b));
+            url.push_str(action);
+        }
+        Ok(url)
+    }
+
+    /// A signed URL for one object: GET to download it (also from a private
+    /// bucket) or PUT to upload it. Calls `POST /storage/sign` on the
+    /// project's address and needs the project's secret key, so call it on a
+    /// server and hand out only the URL.
+    pub async fn create_signed_url(
+        &self,
+        bucket: &str,
+        path: &str,
+        options: SignedUrlOptions,
+    ) -> Result<SignedUrl, PGBHubError> {
+        if options.content_type.is_some() && options.method != SignedUrlMethod::Put {
+            return Err(PGBHubError::local(
+                "invalid_request",
+                "content_type applies only to PUT (upload) signed URLs.",
+            ));
+        }
+        let mut body = serde_json::json!({
+            "bucket": bucket,
+            "path": path.trim_start_matches('/'),
+            "method": options.method,
+        });
+        if let Some(secs) = options.expires_in_secs {
+            body["expires_in"] = serde_json::json!(secs);
+        }
+        if let Some(ct) = options.content_type {
+            body["content_type"] = serde_json::json!(ct);
+        }
+        let url = format!("{}/storage/sign", self.endpoint);
+        request_json(&self.http, reqwest::Method::POST, &url, &self.api_key, &[], Some(body)).await
+    }
+
+    /// PUTs `body` to a signed upload URL from `create_signed_url`. No API
+    /// key is sent: the URL is the credential. If the URL was minted with a
+    /// `content_type`, pass the same one. A relative URL
+    /// (`/storage/_signed/...`) is resolved against the endpoint. Never retried.
+    pub async fn upload_to_signed_url(
+        &self,
+        url: &str,
+        body: impl Into<reqwest::Body>,
+        content_type: &str,
+    ) -> Result<SignedUploadResult, PGBHubError> {
+        let target = if url.starts_with('/') {
+            format!("{}{}", self.endpoint, url)
+        } else {
+            url.to_string()
+        };
+        let resp = self
+            .http
+            .request(reqwest::Method::PUT, &target)
+            .header("Content-Type", content_type)
+            .header("Accept", "application/json")
+            .body(body)
+            .send()
+            .await?;
+        let status = resp.status();
+        let text = resp.text().await?;
+        if !status.is_success() {
+            return Err(api_error(status.as_u16(), &text, None));
+        }
+        if text.trim().is_empty() {
+            return Ok(SignedUploadResult::default());
+        }
+        Ok(serde_json::from_str(&text)?)
+    }
+
+    /// Creates a bucket with the given visibility (`BucketVisibility::default()`
+    /// is public). Needs the project's secret key (or an account key with
+    /// storage rights).
+    pub async fn create_bucket(&self, name: &str, visibility: BucketVisibility) -> Result<Bucket, PGBHubError> {
+        let url = self.buckets_url(None, "")?;
+        let body = serde_json::json!({ "name": name, "visibility": visibility });
+        request_json(&self.http, reqwest::Method::POST, &url, &self.api_key, &[], Some(body)).await
+    }
+
+    /// Makes a bucket private or public. Going private is enforced within
+    /// seconds, but copies a browser or the CDN already fetched are not
+    /// recalled. Going public exposes every object in the bucket, so it
+    /// needs `confirm_public = true`; without it this returns an error with
+    /// code `CONFIRM_PUBLIC_REQUIRED` and sends nothing.
+    pub async fn set_bucket_visibility(
+        &self,
+        name: &str,
+        visibility: BucketVisibility,
+        confirm_public: bool,
+    ) -> Result<BucketVisibilityChange, PGBHubError> {
+        if name.trim().is_empty() {
+            return Err(PGBHubError::local("invalid_request", "set_bucket_visibility needs a bucket name."));
+        }
+        let body = match visibility {
+            BucketVisibility::Private => serde_json::json!({ "visibility": "private" }),
+            BucketVisibility::Public => {
+                if !confirm_public {
+                    return Err(PGBHubError::local(
+                        CONFIRM_PUBLIC_REQUIRED,
+                        format!(
+                            "Making bucket '{}' public exposes every object in it to anyone with its URL. \
+                             Pass confirm_public = true to proceed.",
+                            name
+                        ),
+                    ));
+                }
+                serde_json::json!({ "visibility": "public", "confirm_public": true })
+            }
+        };
+        let url = self.buckets_url(Some(name), "/visibility")?;
+        request_json(&self.http, reqwest::Method::POST, &url, &self.api_key, &[], Some(body)).await
     }
 }
 

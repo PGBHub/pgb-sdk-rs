@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.0 (unreleased)
+
+**New**
+- Storage: private buckets and signed URLs. `client.storage.create_signed_url(bucket, path, SignedUrlOptions { method, expires_in_secs, content_type })` mints a GET or PUT URL for one object (`POST /storage/sign`, secret key). `upload_to_signed_url(url, body, content_type)` uploads to a signed PUT URL without an API key. `create_bucket(name, visibility)` creates a public (`BucketVisibility::default()`) or private bucket. `set_bucket_visibility(name, visibility, confirm_public)` changes it; going public without `confirm_public` returns an error with code `CONFIRM_PUBLIC_REQUIRED` and sends nothing.
+- Types: `BucketVisibility`, `SignedUrlMethod`, `SignedUrlOptions`, `SignedUrl`, `SignedUploadResult`, `Bucket`, `BucketVisibilityChange`.
+- README: a private bucket's objects need the secret key or a signed URL; their public URLs answer 404.
+
 ## 0.1.0 (unreleased)
 
 First release; not yet published.
